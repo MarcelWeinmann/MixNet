@@ -80,12 +80,18 @@ class MixNetTrainer:
         self._centerline = LineHelper(centerline)
         self._raceline = LineHelper(raceline)
 
-        # for logging the losses:
+        # for logging the losses and metrics:
         self._train_loss = 0.0
+        self._train_ade = 0.0
+        self._train_fde = 0.0
+        self._train_mr = 0.0
         self._train_counter = 0
         self._train_logger_step = 0
 
         self._val_loss = 0.0
+        self._val_ade = 0.0
+        self._val_fde = 0.0
+        self._val_mr = 0.0
         self._val_counter = 0
         self._val_logger_step = 0
         self._best_val_loss = np.inf
@@ -312,7 +318,7 @@ class MixNetTrainer:
         ):
             out = self._net(hist, left_bound, right_bound)
 
-            path_loss, vel_loss = self._calc_loss(out, fut, fut_inds)
+            path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
             total_loss = path_loss + vel_loss
 
             # optimization step:
@@ -321,15 +327,26 @@ class MixNetTrainer:
             self._optimizer.step()
 
             # logging:
-            self._log_loss(total_loss, "train")
-            cum_path_loss += path_loss
-            cum_vel_loss += vel_loss
+            self._log_loss(total_loss, ade, fde, mr, "train")
+            
+            p_loss_val = path_loss.item() if torch.is_tensor(path_loss) else path_loss
+            v_loss_val = vel_loss.item() if torch.is_tensor(vel_loss) else vel_loss
+            
+            cum_path_loss += p_loss_val
+            cum_vel_loss += v_loss_val
             epoch_path_loss = cum_path_loss / (i + 1)
             epoch_vel_loss = cum_vel_loss / (i + 1)
 
             # progress bar update:
             self._pbar.update(
-                i, [("train pos MSE", path_loss), ("train vel MSE", vel_loss)]
+                i, 
+                [
+                    ("train pos MSE", p_loss_val), 
+                    ("train vel MSE", v_loss_val),
+                    ("train ADE", ade),
+                    ("train FDE", fde),
+                    ("train MR", mr)
+                ]
             )
 
         self._write_summary("Computation Time/Train", (time.time() - t0), epoch)
@@ -354,6 +371,8 @@ class MixNetTrainer:
 
         cum_path_loss = 0.0
         cum_vel_loss = 0.0
+        cum_ade, cum_fde, cum_mr = 0.0, 0.0, 0.0
+        val_steps = len(self._dataloaders["val"])
 
         with torch.no_grad():
             for i, (hist, fut, fut_inds, left_bound, right_bound) in enumerate(
@@ -361,19 +380,34 @@ class MixNetTrainer:
             ):
                 out = self._net(hist, left_bound, right_bound)
 
-                path_loss, vel_loss = self._calc_loss(out, fut, fut_inds)
-
+                path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
                 total_loss = path_loss + vel_loss
+                
                 # logging:
-                self._log_loss(total_loss, "val")
-                cum_path_loss += path_loss
-                cum_vel_loss += vel_loss
+                self._log_loss(total_loss, ade, fde, mr, "val")
+                
+                p_loss_val = path_loss.item() if torch.is_tensor(path_loss) else path_loss
+                v_loss_val = vel_loss.item() if torch.is_tensor(vel_loss) else vel_loss
+                
+                cum_path_loss += p_loss_val
+                cum_vel_loss += v_loss_val
+                cum_ade += ade
+                cum_fde += fde
+                cum_mr += mr
+                
                 epoch_path_loss = cum_path_loss / (i + 1)
                 epoch_vel_loss = cum_vel_loss / (i + 1)
 
             # progress bar update:
             self._pbar.add(
-                2, [("val pos MSE", epoch_path_loss), ("val vel MSE", epoch_vel_loss)]
+                2, 
+                [
+                    ("val pos MSE", epoch_path_loss), 
+                    ("val vel MSE", epoch_vel_loss),
+                    ("val ADE", cum_ade / val_steps),
+                    ("val FDE", cum_fde / val_steps),
+                    ("val MR", cum_mr / val_steps)
+                ]
             )
 
             # saving the model if necessary:
@@ -401,6 +435,7 @@ class MixNetTrainer:
         self._net.eval()
 
         test_loss = 0.0
+        test_ade, test_fde, test_mr = 0.0, 0.0, 0.0
         test_len = len(self._dataloaders["test"])
 
         with torch.no_grad():
@@ -409,11 +444,21 @@ class MixNetTrainer:
             ]:
                 out = self._net(hist, left_bound, right_bound)
 
-                path_loss, vel_loss = self._calc_loss(out, fut, fut_inds)
-                test_loss += (path_loss + vel_loss) / test_len
+                path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
+                
+                p_loss_val = path_loss.item() if torch.is_tensor(path_loss) else path_loss
+                v_loss_val = vel_loss.item() if torch.is_tensor(vel_loss) else vel_loss
+                
+                test_loss += (p_loss_val + v_loss_val) / test_len
+                test_ade += ade / test_len
+                test_fde += fde / test_len
+                test_mr += mr / test_len
 
-        print("Tested the network in {} s".format(time.time() - t0))
-        print("Test RMSE: {} m".format(test_loss))
+        print("Tested the network in {:.2f} s".format(time.time() - t0))
+        print("Test RMSE: {:.4f} m".format(test_loss))
+        print("Test ADE: {:.4f} m".format(test_ade))
+        print("Test FDE: {:.4f} m".format(test_fde))
+        print("Test MR: {:.4f}".format(test_mr))
         print("-" * 10 + " TESTING END" + "-" * 10)
 
         return test_loss
@@ -489,7 +534,17 @@ class MixNetTrainer:
         # freq^2:
         vel_loss /= freq**2
 
-        return path_loss, vel_loss
+        # Calculate ADE1, FDE1, and MR1
+        with torch.no_grad():
+            l2_distances = torch.norm(fut_out - fut, dim=2)  # Shape: (Batch, Pred_Len)
+
+            ade = l2_distances.mean()
+            fde = l2_distances[:, -1].mean()
+
+            mr_threshold = 2.0
+            mr = (l2_distances[:, -1] > mr_threshold).float().mean()
+
+        return path_loss, vel_loss, ade.item(), fde.item(), mr.item()
 
     def _set_lossfunction(self):
         """Sets up the loss function according to the params."""
@@ -611,14 +666,14 @@ class MixNetTrainer:
             (self._params["training"]["pred_len"] - 1, 5), dtype=torch.float32
         ).to(self._device)
 
-        for i in range(5):
+        for i in range(4):
             self._time_profile_matrix[(i * 10) : ((i + 1) * 10), i] = torch.linspace(
                 0.1, 1.0, 10
             )
 
             self._time_profile_matrix[((i + 1) * 10) :, i] = 1.0
 
-    def _log_loss(self, loss, phase):
+    def _log_loss(self, loss, ade, fde, mr, phase):
         """Logs the loss that was given, according to the phase of training.
 
         args:
@@ -636,26 +691,45 @@ class MixNetTrainer:
         if phase == "train":
             train_log_interval = self._params["logging"]["train_loss_log_interval"]
             self._train_loss += loss / train_log_interval
+            self._train_ade += ade / train_log_interval
+            self._train_fde += fde / train_log_interval
+            self._train_mr += mr / train_log_interval
             self._train_counter += 1
 
             if self._train_counter == train_log_interval:
                 train_epoch_len = len(self._dataloaders["train"])
                 step = self._train_logger_step / (train_epoch_len / train_log_interval)
+                
                 self._write_summary("Loss/Train", self._train_loss, step)
+                self._write_summary("Train/ADE1", self._train_ade, step)
+                self._write_summary("Train/FDE1", self._train_fde, step)
+                self._write_summary("Train/MR1", self._train_mr, step)
 
                 self._train_loss = 0.0
+                self._train_ade = 0.0
+                self._train_fde = 0.0
+                self._train_mr = 0.0
                 self._train_counter = 0
                 self._train_logger_step += 1
 
         elif phase == "val":
             val_len = len(self._dataloaders["val"])
             self._val_loss += loss / val_len
+            self._val_ade += ade / val_len
+            self._val_fde += fde / val_len
+            self._val_mr += mr / val_len
             self._val_counter += 1
 
             if self._val_counter == val_len:
                 self._write_summary("Loss/Val", self._val_loss, self._val_logger_step)
+                self._write_summary("Val/ADE1", self._val_ade, self._val_logger_step)
+                self._write_summary("Val/FDE1", self._val_fde, self._val_logger_step)
+                self._write_summary("Val/MR1", self._val_mr, self._val_logger_step)
 
                 self._val_loss = 0.0
+                self._val_ade = 0.0
+                self._val_fde = 0.0
+                self._val_mr = 0.0
                 self._val_counter = 0
                 self._val_logger_step += 1
 
@@ -695,7 +769,7 @@ class MixNetTrainer:
             ]:
                 mix_out, vel_out, acc_out = self._net(hist, left_bound, right_bound)
 
-                path_loss, vel_loss = self._calc_loss(
+                path_loss, vel_loss, _, _, _ = self._calc_loss(
                     (mix_out, vel_out, acc_out), fut, fut_inds
                 )
 

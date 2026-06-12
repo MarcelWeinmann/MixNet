@@ -22,7 +22,7 @@ sys.path.append(repo_path)
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-matplotlib.use("TkAgg")
+matplotlib.use("Agg")
 
 import numpy as np
 
