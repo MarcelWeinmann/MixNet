@@ -1,5 +1,5 @@
 """Create dataset for MixNet."""
-# Thrid party imports
+# Third party imports
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -19,6 +19,7 @@ class MixNetDataset(Dataset):
                     corresponding to the ground truth prediction.
                 "left_bd": (list of 2D lists) left track boundary snippet.
                 "right_bd": (list of 2D lists) right track boundary snippet.
+                "centerline": (list of 3D lists) the centerline snippet with velocity (x, y, v).
         """
 
         self._cut_probability = cut_probability
@@ -29,7 +30,7 @@ class MixNetDataset(Dataset):
 
         # checking the data:
         keys_gotten = list(data.keys())
-        keys_needed = ["hist", "fut", "fut_inds", "left_bd", "right_bd"]
+        keys_needed = ["hist", "fut", "fut_inds", "left_bd", "right_bd", "centerline"]
 
         for key in keys_needed:
             assert (
@@ -55,8 +56,9 @@ class MixNetDataset(Dataset):
         fut_inds = self.D["fut_inds"][idx]
         left_boundary = self.D["left_bd"][idx, :, :]
         right_boundary = self.D["right_bd"][idx, :, :]
+        centerline = self.D["centerline"][idx, :, :]
 
-        return hist, fut, fut_inds, left_boundary, right_boundary
+        return hist, fut, fut_inds, left_boundary, right_boundary, centerline
 
     def collate_fn(self, samples):
         """Function that defines how the samples are collated when using mini-batch training.
@@ -81,8 +83,11 @@ class MixNetDataset(Dataset):
         fut_inds_batch = torch.zeros((batch_size, len_out), dtype=torch.int16)
         left_bd_batch = torch.zeros((batch_size, len_bound, 2), dtype=torch.float32)
         right_bd_batch = torch.zeros((batch_size, len_bound, 2), dtype=torch.float32)
+        
+        # Centerline expects 3 features: x, y, velocity
+        centerline_batch = torch.zeros((batch_size, len_bound, 3), dtype=torch.float32)
 
-        for i, (hist, fut, fut_inds, left_bd, right_bd) in enumerate(samples):
+        for i, (hist, fut, fut_inds, left_bd, right_bd, centerline) in enumerate(samples):
             # changing the length with a given probability:
             if self._rng.binomial(size=1, n=1, p=self._cut_probability):
                 hist_len = int(self._rng.uniform(self._min_len, hist.shape[0]))
@@ -95,5 +100,6 @@ class MixNetDataset(Dataset):
             fut_inds_batch[i, :] = torch.from_numpy(fut_inds)
             left_bd_batch[i, :, :] = torch.from_numpy(left_bd)
             right_bd_batch[i, :, :] = torch.from_numpy(right_bd)
+            centerline_batch[i, :, :] = torch.from_numpy(centerline)
 
-        return hist_batch, fut_batch, fut_inds_batch, left_bd_batch, right_bd_batch
+        return hist_batch, fut_batch, fut_inds_batch, left_bd_batch, right_bd_batch, centerline_batch

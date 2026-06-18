@@ -192,11 +192,12 @@ class MixNetTrainer:
                     corresponding to the ground truth prediction.
                 "left_bd": (list of 2D lists) left track boundary snippet.
                 "right_bd": (list of 2D lists) right track boundary snippet.
+                "centerline": (list of 3D lists) the centerline snippet (x, y, v).
 
         returns:
             train_data: (dict) the splitted training set with the same keys as data
-            val_data: (dict) the splitted training set with the same keys as data
-            test_data: (dict) the splitted training set with the same keys as data
+            val_data: (dict) the splitted validation set with the same keys as data
+            test_data: (dict) the splitted test set with the same keys as data
         """
         train_size = self._params["data"]["train_size"]
         val_size = self._params["data"]["val_size"]
@@ -214,12 +215,15 @@ class MixNetTrainer:
             val_left_bd,
             train_right_bd,
             val_right_bd,
+            train_centerline,
+            val_centerline,
         ) = train_test_split(
             data["fut_inds"],
             data["hist"],
             data["fut"],
             data["left_bd"],
             data["right_bd"],
+            data["centerline"],
             train_size=train_size,
             random_state=random_state,
         )
@@ -236,12 +240,15 @@ class MixNetTrainer:
             test_left_bd,
             val_right_bd,
             test_right_bd,
+            val_centerline,
+            test_centerline,
         ) = train_test_split(
             val_hist,
             val_fut,
             val_fut_inds,
             val_left_bd,
             val_right_bd,
+            val_centerline,
             train_size=(val_size / (val_size + test_size)),
             random_state=random_state,
         )
@@ -253,6 +260,7 @@ class MixNetTrainer:
             "fut_inds": train_fut_inds,
             "left_bd": train_left_bd,
             "right_bd": train_right_bd,
+            "centerline": train_centerline,
         }
 
         val_data = {
@@ -261,6 +269,7 @@ class MixNetTrainer:
             "fut_inds": val_fut_inds,
             "left_bd": val_left_bd,
             "right_bd": val_right_bd,
+            "centerline": val_centerline,
         }
 
         test_data = {
@@ -269,6 +278,7 @@ class MixNetTrainer:
             "fut_inds": test_fut_inds,
             "left_bd": test_left_bd,
             "right_bd": test_right_bd,
+            "centerline": test_centerline,
         }
 
         return train_data, val_data, test_data
@@ -313,10 +323,10 @@ class MixNetTrainer:
         cum_path_loss = 0.0
         cum_vel_loss = 0.0
 
-        for i, (hist, fut, fut_inds, left_bound, right_bound) in enumerate(
+        for i, (hist, fut, fut_inds, left_bound, right_bound, centerline) in enumerate(
             self._dataloaders["train"]
         ):
-            out = self._net(hist, left_bound, right_bound)
+            out = self._net(hist, left_bound, right_bound, centerline)
 
             path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
             total_loss = path_loss + vel_loss
@@ -375,10 +385,10 @@ class MixNetTrainer:
         val_steps = len(self._dataloaders["val"])
 
         with torch.no_grad():
-            for i, (hist, fut, fut_inds, left_bound, right_bound) in enumerate(
+            for i, (hist, fut, fut_inds, left_bound, right_bound, centerline) in enumerate(
                 self._dataloaders["val"]
             ):
-                out = self._net(hist, left_bound, right_bound)
+                out = self._net(hist, left_bound, right_bound, centerline)
 
                 path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
                 total_loss = path_loss + vel_loss
@@ -439,10 +449,10 @@ class MixNetTrainer:
         test_len = len(self._dataloaders["test"])
 
         with torch.no_grad():
-            for hist, fut, fut_inds, left_bound, right_bound in self._dataloaders[
+            for hist, fut, fut_inds, left_bound, right_bound, centerline in self._dataloaders[
                 "test"
             ]:
-                out = self._net(hist, left_bound, right_bound)
+                out = self._net(hist, left_bound, right_bound, centerline)
 
                 path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
                 
@@ -764,10 +774,10 @@ class MixNetTrainer:
         self._net.eval()
 
         with torch.no_grad():
-            for hist, fut, fut_inds, left_bound, right_bound in self._dataloaders[
+            for hist, fut, fut_inds, left_bound, right_bound, centerline in self._dataloaders[
                 "test"
             ]:
-                mix_out, vel_out, acc_out = self._net(hist, left_bound, right_bound)
+                mix_out, vel_out, acc_out = self._net(hist, left_bound, right_bound, centerline)
 
                 path_loss, vel_loss, _, _, _ = self._calc_loss(
                     (mix_out, vel_out, acc_out), fut, fut_inds

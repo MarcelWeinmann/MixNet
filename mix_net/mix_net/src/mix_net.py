@@ -17,8 +17,11 @@ class MixNet(nn.Module):
 
         self._params = params
 
-        # Input embedding layer:
+        # Input embedding layers:
+        # 2D for hist, left_bound, right_bound (x, y)
         self._ip_emb = torch.nn.Linear(2, params["encoder"]["in_size"])
+        # 3D for centerline (x, y, v)
+        self._ip_emb_3d = torch.nn.Linear(3, params["encoder"]["in_size"])
 
         # History encoder LSTM:
         self._enc_hist = torch.nn.LSTM(
@@ -42,10 +45,21 @@ class MixNet(nn.Module):
             1,
             batch_first=True,
         )
+        
+        # Centerline encoder:
+        self._enc_centerline = torch.nn.LSTM(
+            params["encoder"]["in_size"],
+            params["encoder"]["hidden_size"],
+            1,
+            batch_first=True,
+        )
+
+        # Concatenated size is now 4 * hidden_size (hist, left, right, center)
+        concat_hidden_size = params["encoder"]["hidden_size"] * 4
 
         # Linear stack that outputs the path mixture ratios:
         self._mix_out_layers = self._get_linear_stack(
-            in_size=params["encoder"]["hidden_size"] * 3,
+            in_size=concat_hidden_size,
             hidden_sizes=params["mixer_linear_stack"]["hidden_sizes"],
             out_size=params["mixer_linear_stack"]["out_size"],
             name="mix",
@@ -61,7 +75,7 @@ class MixNet(nn.Module):
 
         # dynamic embedder between the encoder and the decoder:
         self._dyn_embedder = nn.Linear(
-            params["encoder"]["hidden_size"] * 3, params["acc_decoder"]["in_size"]
+            concat_hidden_size, params["acc_decoder"]["in_size"]
         )
 
         # acceleration decoder:
@@ -85,13 +99,14 @@ class MixNet(nn.Module):
 
         self.to(self.device)
 
-    def forward(self, hist, left_bound, right_bound):
+    def forward(self, hist, left_bound, right_bound, centerline):
         """Implements the forward pass of the model.
 
         args:
             hist: [tensor with shape=(batch_size, hist_len, 2)]
             left_bound: [tensor with shape=(batch_size, boundary_len, 2)]
             right_bound: [tensor with shape=(batch_size, boundary_len, 2)]
+            centerline: [tensor with shape=(batch_size, boundary_len, 3)]
 
         returns:
             mix_out: [tensor with shape=(batch_size, out_size)]: The path mixing ratios in the order:
@@ -106,9 +121,12 @@ class MixNet(nn.Module):
         _, (right_h, _) = self._enc_right_bound(
             self._ip_emb(right_bound.to(self.device))
         )
+        _, (center_h, _) = self._enc_centerline(
+            self._ip_emb_3d(centerline.to(self.device))
+        )
 
         # concatenate and squeeze encodings:
-        enc = torch.squeeze(torch.cat((hist_h, left_h, right_h), 2), dim=0)
+        enc = torch.squeeze(torch.cat((hist_h, left_h, right_h, center_h), 2), dim=0)
 
         # path mixture through softmax:
         mix_out = torch.softmax(self._mix_out_layers(enc), dim=1)
@@ -175,10 +193,11 @@ if __name__ == "__main__":
     hist = torch.rand((batch_size, hist_len, 2))
     left_bound = torch.rand((batch_size, bound_len, 2))
     right_bound = torch.rand((batch_size, bound_len, 2))
+    centerline = torch.rand((batch_size, bound_len, 3))
 
     net = MixNet(params)
 
-    mix_out, vel_out, acc_out = net(hist, left_bound, right_bound)
+    mix_out, vel_out, acc_out = net(hist, left_bound, right_bound, centerline)
 
     # printing the output shapes as a sanity check:
     print(
