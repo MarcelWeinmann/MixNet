@@ -328,20 +328,32 @@ class MixNetHandler(HandlerInterface):
         outputs of the network, it will create a relative velocity profile that can be
         added to the initial velocity profile.
 
-        The matrix has the size (N, M) where N is the number of timesteps and M is the
-        number of sections (components) of the vel profile.
+        The matrix has the size (T, S) where T is the number of timesteps (pred_len)
+        and S = num_acc_sections is the number of acceleration sections the network
+        outputs. The block size is DERIVED from num_acc_sections, not hardcoded, so
+        the config value (e.g. 40 -> one acceleration per timestep) is honoured and
+        this stays consistent with the trainer's _get_time_matrix.
         """
 
+        num_steps = self._params["MIX_NET_PARAMS"]["pred_len"]
+        num_sections = self.net.get_params()["acc_decoder"]["num_acc_sections"]
+
         self._time_profile_matrix = np.zeros(
-            (self._params["MIX_NET_PARAMS"]["pred_len"], 5), dtype=np.float32
+            (num_steps, num_sections), dtype=np.float32
         )
 
-        for i in range(5):
-            self._time_profile_matrix[(i * 10) : ((i + 1) * 10), i] = np.linspace(
-                0.1, 1.0, 10
+        base = num_steps // num_sections
+        rem = num_steps % num_sections
+        start = 0
+        for i in range(num_sections):
+            length = base + (1 if i < rem else 0)
+            if length == 0:
+                continue
+            self._time_profile_matrix[start : start + length, i] = np.linspace(
+                1.0 / length, 1.0, length
             )
-
-            self._time_profile_matrix[((i + 1) * 10) :, i] = 1.0
+            self._time_profile_matrix[start + length :, i] = 1.0
+            start += length
 
     def _get_arc_dists(
         self, vels, accels, translations, x_mixes, y_mixes, arc_mixes, obs_storage

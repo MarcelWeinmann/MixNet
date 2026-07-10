@@ -150,22 +150,36 @@ class MixNetTrainer:
             cut_prob = self._params["data"]["cut_hist_probability"]
             min_len = self._params["data"]["min_hist_len"]
 
+            # The train set uses the history-cutting augmentation. The val/test
+            # sets must NOT be augmented, otherwise the reported metrics become
+            # non-reproducible (the dataset RNG advances every epoch) and differ
+            # from a standalone evaluation of the same data.
+            train_set = MixNetDataset(train_data, cut_prob, min_len, random_seed=0)
+            val_set = MixNetDataset(val_data, 0.0, min_len, random_seed=1)
+            test_set = MixNetDataset(test_data, 0.0, min_len, random_seed=2)
+
+            # NOTE: collate_fn must be passed explicitly. Without it the default
+            # collate is used and MixNetDataset.collate_fn (variable history length
+            # + end zero-padding, matching the inference handler) is never applied.
             self._dataloaders["train"] = DataLoader(
-                MixNetDataset(train_data, cut_prob, min_len, random_seed=0),
+                train_set,
                 batch_size=self._params["training"]["batch_size"],
                 shuffle=self._params["data"]["shuffle"],
+                collate_fn=train_set.collate_fn,
             )
 
             self._dataloaders["val"] = DataLoader(
-                MixNetDataset(val_data, cut_prob, min_len, random_seed=1),
+                val_set,
                 batch_size=self._params["training"]["batch_size"],
                 shuffle=self._params["data"]["shuffle"],
+                collate_fn=val_set.collate_fn,
             )
 
             self._dataloaders["test"] = DataLoader(
-                MixNetDataset(test_data, cut_prob, min_len, random_seed=2),
+                test_set,
                 batch_size=self._params["training"]["batch_size"],
                 shuffle=self._params["data"]["shuffle"],
+                collate_fn=test_set.collate_fn,
             )
 
         # saving the created DataLoaders if necessary:
@@ -192,12 +206,11 @@ class MixNetTrainer:
                     corresponding to the ground truth prediction.
                 "left_bd": (list of 2D lists) left track boundary snippet.
                 "right_bd": (list of 2D lists) right track boundary snippet.
-                "centerline": (list of 3D lists) the centerline snippet (x, y, v).
 
         returns:
             train_data: (dict) the splitted training set with the same keys as data
-            val_data: (dict) the splitted validation set with the same keys as data
-            test_data: (dict) the splitted test set with the same keys as data
+            val_data: (dict) the splitted training set with the same keys as data
+            test_data: (dict) the splitted training set with the same keys as data
         """
         train_size = self._params["data"]["train_size"]
         val_size = self._params["data"]["val_size"]
@@ -382,6 +395,7 @@ class MixNetTrainer:
         cum_path_loss = 0.0
         cum_vel_loss = 0.0
         cum_ade, cum_fde, cum_mr = 0.0, 0.0, 0.0
+        cum_d_ade, cum_d_fde, cum_d_mr = 0.0, 0.0, 0.0
         val_steps = len(self._dataloaders["val"])
 
         with torch.no_grad():
@@ -392,33 +406,47 @@ class MixNetTrainer:
 
                 path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
                 total_loss = path_loss + vel_loss
-                
+
+                # deployment-consistent metrics (predicted velocity profile):
+                d_ade, d_fde, d_mr = self._deployment_metrics(out, fut, fut_inds)
+
                 # logging:
                 self._log_loss(total_loss, ade, fde, mr, "val")
-                
+
                 p_loss_val = path_loss.item() if torch.is_tensor(path_loss) else path_loss
                 v_loss_val = vel_loss.item() if torch.is_tensor(vel_loss) else vel_loss
-                
+
                 cum_path_loss += p_loss_val
                 cum_vel_loss += v_loss_val
                 cum_ade += ade
                 cum_fde += fde
                 cum_mr += mr
-                
+                cum_d_ade += d_ade
+                cum_d_fde += d_fde
+                cum_d_mr += d_mr
+
                 epoch_path_loss = cum_path_loss / (i + 1)
                 epoch_vel_loss = cum_vel_loss / (i + 1)
 
             # progress bar update:
             self._pbar.add(
-                2, 
+                2,
                 [
-                    ("val pos MSE", epoch_path_loss), 
+                    ("val pos MSE", epoch_path_loss),
                     ("val vel MSE", epoch_vel_loss),
                     ("val ADE", cum_ade / val_steps),
                     ("val FDE", cum_fde / val_steps),
-                    ("val MR", cum_mr / val_steps)
+                    ("val MR", cum_mr / val_steps),
+                    ("val ADE (deploy)", cum_d_ade / val_steps),
+                    ("val FDE (deploy)", cum_d_fde / val_steps),
+                    ("val MR (deploy)", cum_d_mr / val_steps),
                 ]
             )
+
+            # tensorboard: deployment-consistent validation metrics
+            self._write_summary("Val/ADE1_deploy", cum_d_ade / val_steps, epoch)
+            self._write_summary("Val/FDE1_deploy", cum_d_fde / val_steps, epoch)
+            self._write_summary("Val/MR1_deploy", cum_d_mr / val_steps, epoch)
 
             # saving the model if necessary:
             epoch_total_loss = epoch_path_loss + epoch_vel_loss
@@ -446,6 +474,7 @@ class MixNetTrainer:
 
         test_loss = 0.0
         test_ade, test_fde, test_mr = 0.0, 0.0, 0.0
+        test_d_ade, test_d_fde, test_d_mr = 0.0, 0.0, 0.0
         test_len = len(self._dataloaders["test"])
 
         with torch.no_grad():
@@ -455,20 +484,31 @@ class MixNetTrainer:
                 out = self._net(hist, left_bound, right_bound, centerline)
 
                 path_loss, vel_loss, ade, fde, mr = self._calc_loss(out, fut, fut_inds)
-                
+
+                # deployment-consistent metrics (predicted velocity profile):
+                d_ade, d_fde, d_mr = self._deployment_metrics(out, fut, fut_inds)
+
                 p_loss_val = path_loss.item() if torch.is_tensor(path_loss) else path_loss
                 v_loss_val = vel_loss.item() if torch.is_tensor(vel_loss) else vel_loss
-                
+
                 test_loss += (p_loss_val + v_loss_val) / test_len
                 test_ade += ade / test_len
                 test_fde += fde / test_len
                 test_mr += mr / test_len
+                test_d_ade += d_ade / test_len
+                test_d_fde += d_fde / test_len
+                test_d_mr += d_mr / test_len
 
         print("Tested the network in {:.2f} s".format(time.time() - t0))
         print("Test RMSE: {:.4f} m".format(test_loss))
+        print("--- rail metrics (ground-truth velocity / longitudinal position) ---")
         print("Test ADE: {:.4f} m".format(test_ade))
         print("Test FDE: {:.4f} m".format(test_fde))
         print("Test MR: {:.4f}".format(test_mr))
+        print("--- deployment metrics (predicted velocity profile) ---")
+        print("Test ADE (deploy): {:.4f} m".format(test_d_ade))
+        print("Test FDE (deploy): {:.4f} m".format(test_d_fde))
+        print("Test MR (deploy): {:.4f}".format(test_d_mr))
         print("-" * 10 + " TESTING END" + "-" * 10)
 
         return test_loss
@@ -555,6 +595,109 @@ class MixNetTrainer:
             mr = (l2_distances[:, -1] > mr_threshold).float().mean()
 
         return path_loss, vel_loss, ade.item(), fde.item(), mr.item()
+
+    def _reconstruct_pred_traj(self, mix_i, vprof_i, i0):
+        """Reconstructs a single predicted trajectory using the predicted velocity
+        profile, exactly like the inference handler (mix_net_handler._get_arc_dists):
+        it advances along the mixed path by the predicted per-interval speed and
+        interpolates positions by arc length.
+
+        This differs from the fut_inds-based reconstruction used in _calc_loss and
+        in the visualization: that one places every point at the GROUND-TRUTH
+        longitudinal index, so it silently uses the ground-truth velocity. This one
+        uses the network's OWN velocity, i.e. what actually happens at deployment.
+        Point 0 is anchored at track index i0 (the GT start index).
+
+        args:
+            mix_i: [np.array (4,)] mixing ratios (left, right, center, race).
+            vprof_i: [np.array (pred_len-1,)] predicted per-interval speed [m/s].
+            i0: [int] GT nearest track index of the first prediction step.
+
+        returns:
+            pred: [np.array (pred_len, 2)] predicted trajectory in global coords.
+        """
+
+        dt = 1.0 / self._params["data"]["frequency"]
+        left = self._left_bound.line
+        right = self._right_bound.line
+        center = self._centerline.line
+        race = self._raceline.line
+        n_track = center.shape[0]
+
+        # predicted arc distance of each step (point 0 anchored at the start):
+        arc_pred = np.concatenate(([0.0], np.cumsum(vprof_i * dt)))
+        max_arc = float(arc_pred[-1])
+
+        def mixed(idx):
+            return (
+                mix_i[0] * left[idx]
+                + mix_i[1] * right[idx]
+                + mix_i[2] * center[idx]
+                + mix_i[3] * race[idx]
+            )
+
+        # build the mixed path forward from i0 until it covers max_arc:
+        arcs = [0.0]
+        pts = [mixed(i0)]
+        arclen = 0.0
+        k = 0
+        while arclen < (max_arc + 5.0) and k < n_track:
+            k += 1
+            pt = mixed((i0 + k) % n_track)
+            arclen += float(np.linalg.norm(pt - pts[-1]))
+            arcs.append(arclen)
+            pts.append(pt)
+        arcs = np.asarray(arcs)
+        pts = np.asarray(pts)
+
+        # interpolate the mixed path at the predicted arc distances:
+        px = np.interp(arc_pred, arcs, pts[:, 0])
+        py = np.interp(arc_pred, arcs, pts[:, 1])
+        return np.stack((px, py), axis=1)
+
+    def _deployment_metrics(self, out, fut, fut_inds):
+        """Deployment-consistent ADE / FDE / MR over a batch.
+
+        _calc_loss places every predicted point at the GROUND-TRUTH longitudinal
+        index (fut_inds), so its ADE/FDE only measure the lateral path mixing and
+        silently use the ground-truth velocity profile. This reconstructs each
+        trajectory with the network's OWN predicted velocity profile (via
+        _reconstruct_pred_traj, matching mix_net_handler), so velocity-prediction
+        errors are reflected in the position metrics.
+
+        args:
+            out: (mix_out, vel_out, acc_out) as returned by the network.
+            fut: [tensor (batch, pred_len, 2)] ground truth future (global coords).
+            fut_inds: [tensor (batch, pred_len)] GT nearest track indices.
+
+        returns:
+            (ade, fde, mr) floats averaged over the batch.
+        """
+
+        (mix_out, vel_out, acc_out) = out
+
+        # predicted per-interval speed, identical formula to the velocity loss:
+        pred_len = fut.shape[1]
+        vprof = torch.ones(
+            (fut.shape[0], pred_len - 1), dtype=torch.float32, device=self._device
+        ) * vel_out
+        vprof = vprof + (self._time_profile_matrix @ acc_out.T).T
+
+        mix = mix_out.detach().cpu().numpy()
+        vprof = vprof.detach().cpu().numpy()
+        fut_np = fut.detach().cpu().numpy()
+        inds = fut_inds.numpy() if torch.is_tensor(fut_inds) else np.asarray(fut_inds)
+
+        ade_l, fde_l, mr_l = [], [], []
+        mr_threshold = 2.0
+        for i in range(fut_np.shape[0]):
+            pred = self._reconstruct_pred_traj(mix[i], vprof[i], int(inds[i, 0]))
+            d = np.linalg.norm(pred - fut_np[i], axis=1)
+            ade_l.append(d.mean())
+            fde_l.append(d[-1])
+            mr_l.append(float(d[-1] > mr_threshold))
+
+        return float(np.mean(ade_l)), float(np.mean(fde_l)), float(np.mean(mr_l))
 
     def _set_lossfunction(self):
         """Sets up the loss function according to the params."""
@@ -673,15 +816,15 @@ class MixNetTrainer:
         """
 
         self._time_profile_matrix = torch.zeros(
-            (self._params["training"]["pred_len"] - 1, 5), dtype=torch.float32
+            (self._params["training"]["pred_len"] - 1, 40), dtype=torch.float32
         ).to(self._device)
 
-        for i in range(4):
-            self._time_profile_matrix[(i * 10) : ((i + 1) * 10), i] = torch.linspace(
-                0.1, 1.0, 10
+        for i in range(40):
+            self._time_profile_matrix[(i) : (i + 1), i] = torch.linspace(
+                0.1, 1.0, 1
             )
 
-            self._time_profile_matrix[((i + 1) * 10) :, i] = 1.0
+            self._time_profile_matrix[(i + 1):, i] = 1.0
 
     def _log_loss(self, loss, ade, fde, mr, phase):
         """Logs the loss that was given, according to the phase of training.
@@ -773,6 +916,12 @@ class MixNetTrainer:
 
         self._net.eval()
 
+        import shutil  # Make sure this is imported at the top of your file
+        # Force internal rendering
+        plt.rcParams.update({
+                "text.usetex": False,
+                "font.family": "sans-serif"
+        })
         with torch.no_grad():
             for hist, fut, fut_inds, left_bound, right_bound, centerline in self._dataloaders[
                 "test"
@@ -793,7 +942,7 @@ class MixNetTrainer:
                 acc_out_np = acc_out.to("cpu").numpy()
 
                 for i in range(mix_out.shape[0]):
-                    fig = plt.figure(figsize=(15, 15))
+                    fig = plt.figure(figsize=(30, 30))
                     if self._params["plt_vel"]:
                         ax = fig.add_subplot(221)
                         axvel = fig.add_subplot(222)
@@ -817,6 +966,53 @@ class MixNetTrainer:
                         + mix_out_np[i, 2] * center
                         + mix_out_np[i, 3] * race
                     )
+
+                    # --- CALCULATE PER-SAMPLE METRICS ---
+                    # 1. Path RMSE
+                    sample_path_mse = np.mean((pred - fut_np[i, :, :]) ** 2)
+                    sample_path_rmse = np.sqrt(sample_path_mse)
+
+                    # 2. ADE, FDE, and MR
+                    # Calculate point-wise L2 distances between prediction and ground truth
+                    sample_l2_distances = np.linalg.norm(pred - fut_np[i, :, :], axis=1)
+                    sample_ade = np.mean(sample_l2_distances)
+                    sample_fde = sample_l2_distances[-1]
+                    
+                    # Using the same 2.0m threshold defined in your _calc_loss method
+                    sample_mr = 1.0 if sample_fde > 2.0 else 0.0
+
+                    # 3. Velocity RMSE
+                    freq = self._params["data"]["frequency"]
+                    vel_profile = (
+                        np.linalg.norm(
+                            (fut_np[i, 1:, :] - fut_np[i, :-1, :]), axis=1
+                        )
+                        * freq
+                    )
+                    vel_profile_out = np.ones_like(vel_profile) * vel_out_np[i, 0]
+                    rel_vel = (
+                        self._time_profile_matrix.to("cpu").numpy()
+                        @ acc_out_np[i, :].T
+                    ).T
+                    vel_profile_out = vel_profile_out + rel_vel
+
+                    # Match the freq^2 scaling used in _calc_loss
+                    sample_vel_mse = np.mean((vel_profile - vel_profile_out) ** 2) / (freq ** 2)
+                    sample_vel_rmse = np.sqrt(sample_vel_mse)
+                    # ----------------------------------
+
+                    # --- DEPLOYMENT-CONSISTENT PREDICTION ---
+                    # `pred` above places every point at the GROUND-TRUTH longitudinal
+                    # index (fut_inds), i.e. it uses the ground-truth velocity. This
+                    # reconstructs the trajectory the way the inference handler does,
+                    # advancing along the mixed path with the PREDICTED velocity profile.
+                    pred_deploy = self._reconstruct_pred_traj(
+                        mix_out_np[i], vel_profile_out, int(inds[0])
+                    )
+                    deploy_l2 = np.linalg.norm(pred_deploy - fut_np[i, :, :], axis=1)
+                    deploy_ade = np.mean(deploy_l2)
+                    deploy_fde = deploy_l2[-1]
+                    # ----------------------------------
 
                     # plot net input
                     hist_loc = hist[i, :, :]
@@ -850,30 +1046,22 @@ class MixNetTrainer:
                         linestyle="solid",
                     )
 
-                    # plot output
-                    str1 = "$\mathrm{RMSE}_{\mathrm{path}}$ = " + "{:.02f} m".format(
-                        path_loss
-                    )
-                    str2 = "$\mathrm{RMSE}_{\mathrm{vel}}$ = " + "{:.02f} m".format(
-                        vel_loss
-                    )
+                    # plot output using the per-sample metrics
+                    str1 = "RMSE_path={:.02f}m, RMSE_vel={:.02f}m".format(sample_path_rmse, sample_vel_rmse)
+                    str2 = "rail (GT vel): ADE={:.02f}m, FDE={:.02f}m, MR={:.0f}".format(sample_ade, sample_fde, sample_mr)
+                    str3 = "deploy (pred vel): ADE={:.02f}m, FDE={:.02f}m".format(deploy_ade, deploy_fde)
 
-                    rho1 = r"$\rho_{\mathrm{left}}$ = " + "{:.02f}".format(
-                        mix_out_np[i, 0]
-                    )
-                    rho2 = r"$\rho_{\mathrm{right}}$ = " + "{:.02f}".format(
-                        mix_out_np[i, 1]
-                    )
-                    rho3 = r"$\rho_{\mathrm{center}}$ = " + "{:.02f}".format(
-                        mix_out_np[i, 2]
-                    )
-                    rho4 = r"$\rho_{\mathrm{race}}$ = " + "{:.02f}".format(
-                        mix_out_np[i, 3]
-                    )
+                    rho1 = "rho_left={:.02f}".format(mix_out_np[i, 0])
+                    rho2 = "rho_right={:.02f}".format(mix_out_np[i, 1])
+                    rho3 = "rho_center={:.02f}".format(mix_out_np[i, 2])
+                    rho4 = "rho_race={:.02f}".format(mix_out_np[i, 3])
+
+                    # Split title into multiple lines so it fits on the figure
                     ax2.set_title(
-                        "Prediction: {}, {};  Weights: {}, {}, {}, {}".format(
-                            str1, str2, rho1, rho2, rho3, rho4
-                        )
+                        "{}; {}\n{}\nWeights: {}, {}, {}, {}".format(
+                            str1, str2, str3, rho1, rho2, rho3, rho4
+                        ),
+                        fontsize=12 # slightly smaller to ensure it fits well
                     )
 
                     ax2.plot(
@@ -887,51 +1075,23 @@ class MixNetTrainer:
                         pred[:, 0],
                         pred[:, 1],
                         color=MIX_NET_COL,
-                        label="Prediction",
+                        label="Prediction (rail, GT vel)",
                     )
                     ax2.plot(
-                        left[:, 0],
-                        left[:, 1],
-                        color=BOUND_COL,
-                        label="Base Curves",
+                        pred_deploy[:, 0],
+                        pred_deploy[:, 1],
+                        color=INDY_NET_COL,
+                        linestyle="dashed",
+                        label="Prediction (deploy, pred vel)",
                     )
                     ax2.plot(
-                        right[:, 0],
-                        right[:, 1],
-                        color=BOUND_COL,
+                        left[:, 0], left[:, 1], color=BOUND_COL, label="Base Curves"
                     )
-                    ax2.plot(
-                        center[:, 0],
-                        center[:, 1],
-                        color=BOUND_COL,
-                    )
-                    ax2.plot(
-                        race[:, 0],
-                        race[:, 1],
-                        color=BOUND_COL,
-                    )
+                    ax2.plot(right[:, 0], right[:, 1], color=BOUND_COL)
+                    ax2.plot(center[:, 0], center[:, 1], color=BOUND_COL)
+                    ax2.plot(race[:, 0], race[:, 1], color=BOUND_COL)
 
                     if self._params["plt_vel"]:
-                        # velocity profile:
-                        # claculating the velocity loss:
-                        freq = self._params["data"]["frequency"]
-                        vel_profile = (
-                            np.linalg.norm(
-                                (fut_np[i, 1:, :] - fut_np[i, :-1, :]), axis=1
-                            )
-                            * freq
-                        )
-
-                        vel_profile_out = np.ones_like(vel_profile)
-                        vel_profile_out = vel_profile_out * vel_out_np[i, 0]
-
-                        # relative velocity profile
-                        rel_vel = (
-                            self._time_profile_matrix.to("cpu").numpy()
-                            @ acc_out_np[i, :].T
-                        ).T
-                        vel_profile_out = vel_profile_out + rel_vel
-
                         # plotting the vel profile:
                         axvel.plot(
                             np.arange(vel_profile.size),
@@ -947,41 +1107,34 @@ class MixNetTrainer:
                             label="Prediction",
                         )
                         axvel.set_title("Velocity Profile")
-                        axvel.set_xlabel("$n_{\mathrm{pred}}$")
-                        axvel.set_ylabel("$v$ in m/s")
+                        axvel.set_xlabel("n_pred")
+                        axvel.set_ylabel("v in m/s")
                         axvel.grid(True)
                         axvel.legend()
 
-                    ax.set_xlabel("$x_{\mathrm{loc}}$ in m")
-                    ax.set_ylabel("$y_{\mathrm{loc}}$ in m")
+                    ax.set_xlabel("x_loc in m")
+                    ax.set_ylabel("y_loc in m")
                     ax.grid(True)
                     ax.legend()
 
-                    ax2.set_xlabel("$x_{\mathrm{glob}}$ in m")
-                    ax2.set_ylabel("$y_{\mathrm{glob}}$ in m")
+                    ax2.set_xlabel("x_glob in m")
+                    ax2.set_ylabel("y_glob in m")
                     ax2.grid(True)
                     ax2.legend()
-
-                    if self._params["save_figs"]:
-                        fig_save_path = "train/figs"
-                        if i == 0:
-                            if not os.path.exists(fig_save_path):
-                                os.makedirs(fig_save_path)
-                            else:
-                                _ = [
-                                    os.remove(os.path.join(fig_save_path, k))
-                                    for k in os.listdir(fig_save_path)
-                                ]
-                        plt.savefig(
-                            os.path.join(fig_save_path, "%05d.svg" % i),
-                            format="svg",
-                            dpi=300,
-                        )
-                    else:
-                        plt.show()
-
+                    
+                    fig_save_path = "train/figs"
+                    if i == 0:
+                        if not os.path.exists(fig_save_path):
+                            os.makedirs(fig_save_path)
+                        else:
+                            shutil.rmtree(fig_save_path)
+                            os.makedirs(fig_save_path)
+                            
+                    plt.savefig(
+                        os.path.join(fig_save_path, f"{i}.png"),
+                        format="png"
+                    )
                     plt.close()
-
                     if i + 1 >= args.max_plots:
                         break
 
